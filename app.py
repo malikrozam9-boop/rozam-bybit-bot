@@ -307,7 +307,7 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
 
 
 # ==============================================================================
-# 5. MAIN APP
+# 5. MAIN APP WITH PERSISTENT SESSION STATE
 # ==============================================================================
 def main():
     if "executed_bar_signals" not in st.session_state:
@@ -320,10 +320,11 @@ def main():
     with st.sidebar:
         st.header("Control Panel")
 
+        # Persistent Coin Selection using session_state
         selected_pair = st.selectbox(
             "1. Select Spot Coin Pair",
             options=list(SUPPORTED_COINS.keys()),
-            index=0,
+            key="selected_pair_key",
         )
         coin_meta = SUPPORTED_COINS[selected_pair]
         symbol = coin_meta["symbol"]
@@ -334,14 +335,15 @@ def main():
 
         st.divider()
 
+        # Persistent Trade Amount
         st.subheader("2. Trade Amount (USDT)")
         slider_usdt = st.slider(
             "Select Trade Size ($10 - $500 USDT)",
             min_value=10.0,
             max_value=500.0,
-            value=float(st.session_state.trade_amount_usdt),
             step=5.0,
             format="$%.0f",
+            key="slider_usdt_key",
         )
         input_usdt = st.number_input(
             "Exact Trade Amount (USDT)",
@@ -350,6 +352,7 @@ def main():
             value=float(slider_usdt),
             step=5.0,
             format="%.2f",
+            key="input_usdt_key",
         )
         trade_amount_usdt = float(input_usdt)
         st.session_state.trade_amount_usdt = trade_amount_usdt
@@ -369,13 +372,15 @@ def main():
             options=["Closed Candle (Confirmed)", "Live Forming Candle"],
             index=0,
         )
+        
+        # Persistent Auto-Trade Toggle
         auto_trade_enabled = st.toggle(
             f"Auto-Trade {selected_pair} (${trade_amount_usdt:.0f} USDT)",
-            value=False,
+            key="auto_trade_toggle_key",
         )
 
-        auto_refresh = st.toggle("Auto-Refresh Live Chart", value=True)
-        refresh_seconds = st.slider("Refresh Interval (s)", min_value=5, max_value=60, value=15)
+        auto_refresh = st.toggle("Auto-Refresh Live Chart", value=True, key="auto_refresh_key")
+        refresh_seconds = st.slider("Refresh Interval (s)", min_value=5, max_value=60, value=15, key="refresh_sec_key")
 
     st.title(f"Rozam Bot — {selected_pair} Bybit Spot Chandelier Exit (22, 3)")
     
