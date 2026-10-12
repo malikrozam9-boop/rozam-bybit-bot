@@ -33,29 +33,23 @@ SUPPORTED_COINS = {
 }
 
 CATEGORY = "spot"
-INTERVAL = "15m"  # 15-minute timeframe
+INTERVAL = "15m"
 ATR_PERIOD = 22
 ATR_MULT = 3.0
 
 
 # ==============================================================================
-# 2. BYBIT V5 MARKET DATA & ORDER EXECUTION (SECURE CCXT + REQUESTS)
+# 2. MARKET DATA & ORDER EXECUTION
 # ==============================================================================
 def fetch_bybit_spot_klines(symbol: str, timeframe: str = INTERVAL, limit: int = 200) -> pd.DataFrame:
-    """
-    Fetch 15-minute Spot OHLCV klines securely using CCXT Bybit.
-    """
     exchange = ccxt.bybit({
         "enableRateLimit": True,
         "options": {"defaultType": "spot"}
     })
     
-    # Try fetching via CCXT Bybit. If CloudFront blocks public klines on US servers, 
-    # CCXT allows fallback or standard headers.
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception:
-        # Fallback to Binance public candles for chart visualization if Bybit public IP is restricted on Cloud
         exchange_fallback = ccxt.binance({"enableRateLimit": True})
         ohlcv = exchange_fallback.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
@@ -83,15 +77,9 @@ def place_bybit_spot_order_usdt(
     last_price: float,
     qty_decimals: int = 4,
 ) -> dict:
-    """
-    Execute an actual Market order on Bybit Spot using CCXT authenticated private API.
-    CCXT automatically handles HMAC signing, timestamp, recvWindow, and routing headers,
-    which securely bypasses standard IP restriction headers on cloud servers.
-    """
     if not BYBIT_API_KEY or not BYBIT_API_SECRET:
         raise PermissionError("Missing BYBIT_API_KEY or BYBIT_API_SECRET in Streamlit Secrets.")
 
-    # Initialize CCXT Bybit with credentials for authenticated private trading
     exchange = ccxt.bybit({
         "apiKey": BYBIT_API_KEY,
         "secret": BYBIT_API_SECRET,
@@ -100,11 +88,6 @@ def place_bybit_spot_order_usdt(
     })
 
     if side == "Buy":
-        # For Spot Market Buy using USDT quote amount
-        params = {
-            "marketUnit": "quoteCoin",
-        }
-        # CCXT create_market_order for quote amount or calculated base amount
         base_qty = trade_amount_usdt / max(last_price, 1e-9)
         response = exchange.create_market_buy_order(symbol, base_qty, params={"marketUnit": "quoteCoin", "qty": f"{trade_amount_usdt:.2f}"})
     else:
@@ -193,7 +176,7 @@ def calculate_chandelier_exit(
 
 
 # ==============================================================================
-# 4. PLOTLY LIVE CANDLESTICK + CHANDELIER EXIT CHART
+# 4. PLOTLY CHART
 # ==============================================================================
 def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Figure:
     fig = go.Figure()
@@ -275,7 +258,7 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
 
 
 # ==============================================================================
-# 5. STREAMLIT SIDEBAR CONTROL PANEL & DYNAMIC TRADING ENGINE
+# 5. MAIN APP
 # ==============================================================================
 def main():
     if "executed_bar_signals" not in st.session_state:
@@ -292,7 +275,6 @@ def main():
             "1. Select Spot Coin Pair",
             options=list(SUPPORTED_COINS.keys()),
             index=0,
-            help="Select the Bybit Spot pair. Changing this updates the live 15m chart and Spot orders immediately.",
         )
         coin_meta = SUPPORTED_COINS[selected_pair]
         symbol = coin_meta["symbol"]
@@ -327,9 +309,9 @@ def main():
         st.subheader("Strategy & Execution Settings")
         keys_configured = bool(BYBIT_API_KEY and BYBIT_API_SECRET)
         if keys_configured:
-            st.success(f"Bybit API Key Active ({BYBIT_API_KEY[:4]}...{BYBIT_API_KEY[-4:]})")
+            st.success(f"Bybit API Key Active")
         else:
-            st.warning("BYBIT_API_KEY / BYBIT_API_SECRET not set in env.")
+            st.warning("BYBIT_API_KEY / BYBIT_API_SECRET not set.")
 
         use_close_extremes = st.checkbox("Use Close Price for Extremums", value=True)
         signal_bar_mode = st.selectbox(
@@ -340,18 +322,13 @@ def main():
         auto_trade_enabled = st.toggle(
             f"Auto-Trade {selected_pair} (${trade_amount_usdt:.0f} USDT)",
             value=False,
-            help="Automatically executes a Bybit Spot Market order for the selected coin and USDT amount on Buy/Sell flips.",
         )
 
         auto_refresh = st.toggle("Auto-Refresh Live Chart", value=True)
         refresh_seconds = st.slider("Refresh Interval (s)", min_value=5, max_value=60, value=15)
 
     st.title(f"Rozam Bot — {selected_pair} Bybit Spot Chandelier Exit (22, 3)")
-    st.caption(
-        f"Active Pair: {selected_pair} · Order Size: ${trade_amount_usdt:,.2f} USDT · "
-        f"Timeframe: 15-Minute · Indicator: Chandelier Exit ({ATR_PERIOD}, {ATR_MULT})"
-    )
-
+    
     try:
         raw_df = fetch_bybit_spot_klines(symbol=symbol, timeframe=INTERVAL, limit=200)
         df = calculate_chandelier_exit(
@@ -361,7 +338,7 @@ def main():
             use_close=use_close_extremes,
         )
     except Exception as exc:
-        st.error(f"Error fetching {selected_pair} market data: {exc}")
+        st.error(f"Error fetching market data: {exc}")
         return
 
     eval_row = df.iloc[-2] if signal_bar_mode.startswith("Closed") else df.iloc[-1]
@@ -372,7 +349,6 @@ def main():
     with st.sidebar:
         st.divider()
         st.subheader(f"Manual {selected_pair} Spot Trade")
-        st.caption(f"${trade_amount_usdt:,.2f} USDT ≈ {estimated_base_qty:.{qty_decimals}f} {base_coin}")
         col_buy, col_sell = st.columns(2)
         with col_buy:
             if st.button(f"BUY ${trade_amount_usdt:.0f}", use_container_width=True, type="primary"):
@@ -384,19 +360,8 @@ def main():
                         last_price=current_price,
                         qty_decimals=qty_decimals,
                     )
-                    st.session_state.order_history.insert(
-                        0,
-                        {
-                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                            "pair": selected_pair,
-                            "type": "MANUAL_BUY",
-                            "side": "Buy",
-                            "amount_usdt": trade_amount_usdt,
-                            "est_base_qty": round(estimated_base_qty, qty_decimals),
-                            "response": res,
-                        },
-                    )
-                    st.toast(f"Bought ${trade_amount_usdt:.0f} of {selected_pair} on Bybit Successfully!")
+                    st.session_state.order_history.insert(0, {"type": "MANUAL_BUY", "response": res})
+                    st.toast(f"Bought successfully!")
                 except Exception as exc:
                     st.error(f"Manual Buy Failed: {exc}")
 
@@ -410,42 +375,10 @@ def main():
                         last_price=current_price,
                         qty_decimals=qty_decimals,
                     )
-                    st.session_state.order_history.insert(
-                        0,
-                        {
-                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                            "pair": selected_pair,
-                            "type": "MANUAL_SELL",
-                            "side": "Sell",
-                            "amount_usdt": trade_amount_usdt,
-                            "est_base_qty": round(estimated_base_qty, qty_decimals),
-                            "response": res,
-                        },
-                    )
-                    st.toast(f"Sold ${trade_amount_usdt:.0f} of {selected_pair} on Bybit Successfully!")
+                    st.session_state.order_history.insert(0, {"type": "MANUAL_SELL", "response": res})
+                    st.toast(f"Sold successfully!")
                 except Exception as exc:
                     st.error(f"Manual Sell Failed: {exc}")
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric(f"{selected_pair} Spot Price", f"${current_price:,.{price_decimals}f}")
-    m2.metric(
-        "Trade Size (USDT -> Coin)",
-        f"${trade_amount_usdt:,.0f} USDT",
-        f"≈ {estimated_base_qty:.{qty_decimals}f} {base_coin}",
-    )
-    m3.metric(
-        "Chandelier Trend",
-        "BULLISH (LONG)" if latest_row["direction"] == 1 else "BEARISH (SHORT)",
-    )
-    active_stop = latest_row["long_stop"] if latest_row["direction"] == 1 else latest_row["short_stop"]
-    m4.metric("Active Trailing Stop", f"${active_stop:,.{price_decimals}f}")
-
-    latest_sig_text = "HOLD / NO FLIP"
-    if eval_row["buy_signal"]:
-        latest_sig_text = "BUY SIGNAL"
-    elif eval_row["sell_signal"]:
-        latest_sig_text = "SELL SIGNAL"
-    m5.metric("Evaluation Candle Signal", latest_sig_text)
 
     bar_ts = int(eval_row["timestamp"])
     if auto_trade_enabled:
@@ -461,26 +394,13 @@ def main():
                         qty_decimals=qty_decimals,
                     )
                     st.session_state.executed_bar_signals.add(sig_key)
-                    st.session_state.order_history.insert(
-                        0,
-                        {
-                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                            "pair": selected_pair,
-                            "type": "AUTO_CHANDELIER_BUY",
-                            "side": "Buy",
-                            "amount_usdt": trade_amount_usdt,
-                            "est_base_qty": round(estimated_base_qty, qty_decimals),
-                            "bar_time": str(eval_row["datetime"]),
-                            "response": order_res,
-                        },
-                    )
-                    st.success(f"Auto-Executed Spot BUY of ${trade_amount_usdt:.2f} USDT on Bybit!")
+                    st.session_state.order_history.insert(0, {"type": "AUTO_BUY", "response": order_res})
                 except Exception as exc:
-                    st.error(f"Auto-Buy Order Execution Error: {exc}")
+                    st.error(f"Auto-Buy Error: {exc}")
 
         elif eval_row["sell_signal"]:
             sig_key = f"{symbol}_{bar_ts}_SELL"
-            if sig_key not in st.session_state.executed_link := sig_key not in st.session_state.executed_bar_signals:
+            if sig_key not in st.session_state.executed_bar_signals:
                 try:
                     order_res = place_bybit_spot_order_usdt(
                         symbol=symbol,
@@ -490,43 +410,12 @@ def main():
                         qty_decimals=qty_decimals,
                     )
                     st.session_state.executed_bar_signals.add(sig_key)
-                    st.session_state.order_history.insert(
-                        0,
-                        {
-                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                            "pair": selected_pair,
-                            "type": "AUTO_CHANDELIER_SELL",
-                            "side": "Sell",
-                            "amount_usdt": trade_amount_usdt,
-                            "est_base_qty": round(estimated_base_qty, qty_decimals),
-                            "bar_time": str(eval_row["datetime"]),
-                            "response": order_res,
-                        },
-                    )
-                    st.warning(f"Auto-Executed Spot SELL of ${trade_amount_usdt:.2f} USDT on Bybit!")
+                    st.session_state.order_history.insert(0, {"type": "AUTO_SELL", "response": order_res})
                 except Exception as exc:
-                    st.error(f"Auto-Sell Order Execution Error: {exc}")
+                    st.error(f"Auto-Sell Error: {exc}")
 
     fig = build_plotly_chart(df, pair_label=selected_pair, symbol=symbol)
     st.plotly_chart(fig, use_container_width=True)
-
-    col_signals, col_orders = st.columns(2)
-    with col_signals:
-        st.subheader(f"Recent {selected_pair} Chandelier Exit (22, 3) Signals")
-        signals_df = df[df["buy_signal"] | df["sell_signal"]].copy()
-        if not signals_df.empty:
-            signals_df["Signal"] = np.where(signals_df["buy_signal"], "BUY", "SELL")
-            display_cols = signals_df[["datetime", "Signal", "close", "atr", "long_stop", "short_stop"]].tail(10)
-            st.dataframe(display_cols.sort_values("datetime", ascending=False), use_container_width=True)
-        else:
-            st.info(f"No trend-flip signals detected for {selected_pair} in the current 200-candle window.")
-
-    with col_orders:
-        st.subheader("Bybit Spot Order Execution Log")
-        if st.session_state.order_history:
-            st.json(st.session_state.order_history[:10])
-        else:
-            st.info("No Spot orders executed in this session yet.")
 
     if auto_refresh:
         time.sleep(refresh_seconds)
