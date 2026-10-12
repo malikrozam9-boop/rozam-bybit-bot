@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+import ccxt
 
 # ==============================================================================
 # 1. PAGE CONFIGURATION & ENVIRONMENT VARIABLES
@@ -24,21 +25,21 @@ BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 BYBIT_BASE_URL = os.environ.get("BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/")
 
 SUPPORTED_COINS = {
-    "SOL/USDT": {"symbol": "SOLUSDT", "base": "SOL", "decimals": 2, "qty_decimals": 4},
-    "BTC/USDT": {"symbol": "BTCUSDT", "base": "BTC", "decimals": 2, "qty_decimals": 6},
-    "ETH/USDT": {"symbol": "ETHUSDT", "base": "ETH", "decimals": 2, "qty_decimals": 5},
-    "BNB/USDT": {"symbol": "BNBUSDT", "base": "BNB", "decimals": 2, "qty_decimals": 4},
-    "XRP/USDT": {"symbol": "XRPUSDT", "base": "XRP", "decimals": 4, "qty_decimals": 2},
+    "SOL/USDT": {"symbol": "SOL/USDT", "bybit_symbol": "SOLUSDT", "base": "SOL", "decimals": 2, "qty_decimals": 4},
+    "BTC/USDT": {"symbol": "BTC/USDT", "bybit_symbol": "BTCUSDT", "base": "BTC", "decimals": 2, "qty_decimals": 6},
+    "ETH/USDT": {"symbol": "ETH/USDT", "bybit_symbol": "ETHUSDT", "base": "ETH", "decimals": 2, "qty_decimals": 5},
+    "BNB/USDT": {"symbol": "BNB/USDT", "bybit_symbol": "BNBUSDT", "base": "BNB", "decimals": 2, "qty_decimals": 4},
+    "XRP/USDT": {"symbol": "XRP/USDT", "bybit_symbol": "XRPUSDT", "base": "XRP", "decimals": 4, "qty_decimals": 2},
 }
 
 CATEGORY = "spot"
-INTERVAL = "15"  # 15-minute timeframe
+INTERVAL = "15m"  # 15-minute timeframe for CCXT
 ATR_PERIOD = 22
 ATR_MULT = 3.0
 
 
 # ==============================================================================
-# 2. BYBIT V5 REST API HELPERS (MARKET DATA & SPOT ORDER EXECUTION)
+# 2. BYBIT V5 REST API HELPERS (MARKET DATA VIA CCXT & SPOT ORDER EXECUTION)
 # ==============================================================================
 def _generate_bybit_signature(timestamp: str, api_key: str, recv_window: str, payload: str, api_secret: str) -> str:
     """Generate HMAC-SHA256 signature for Bybit V5 API."""
@@ -50,39 +51,27 @@ def _generate_bybit_signature(timestamp: str, api_key: str, recv_window: str, pa
     ).hexdigest()
 
 
-def fetch_bybit_spot_klines(symbol: str, interval: str = INTERVAL, limit: int = 200) -> pd.DataFrame:
+def fetch_bybit_spot_klines(symbol: str, timeframe: str = INTERVAL, limit: int = 200) -> pd.DataFrame:
     """
-    Fetch 15-minute Spot OHLCV klines from Bybit V5 API (/v5/market/kline) for the selected symbol.
+    Fetch 15-minute Spot OHLCV klines securely using CCXT to bypass cloud 403 blocks.
     Returns a chronological DataFrame with columns:
     [timestamp, datetime, open, high, low, close, volume, turnover]
     """
-    url = f"{BYBIT_BASE_URL}/v5/market/kline"
-    params = {
-        "category": CATEGORY,
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-    }
-    response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
-    data = response.json()
-
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit API Error ({data.get('retCode')}): {data.get('retMsg')}")
-
-    raw_list = data.get("result", {}).get("list", [])
-    if not raw_list:
-        raise ValueError(f"No kline data returned from Bybit Spot API for {symbol}.")
+    exchange = ccxt.bybit({"enableRateLimit": True})
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    
+    if not ohlcv:
+        raise ValueError(f"No kline data returned from CCXT for {symbol}.")
 
     df = pd.DataFrame(
-        raw_list,
-        columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+        ohlcv,
+        columns=["timestamp", "open", "high", "low", "close", "volume"],
     )
+    df["turnover"] = df["close"] * df["volume"] # approximation for turnover
     df["timestamp"] = df["timestamp"].astype(np.int64)
     for col in ["open", "high", "low", "close", "volume", "turnover"]:
         df[col] = df[col].astype(float)
 
-    # Bybit returns newest first; sort ascending by timestamp
     df = df.sort_values("timestamp").reset_index(drop=True)
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df
@@ -97,9 +86,6 @@ def place_bybit_spot_order_usdt(
 ) -> dict:
     """
     Execute an actual Market order on Bybit Spot (/v5/order/create) dynamically sized by Trade Amount in USDT.
-    - For Spot Market BUY: uses marketUnit='quoteCoin' with qty = USDT amount (e.g. '50' for $50 USDT).
-    - For Spot Market SELL: converts USDT amount to base coin quantity (trade_amount_usdt / last_price)
-      with marketUnit='baseCoin' so the exact USDT-equivalent position is sold.
     """
     if not BYBIT_API_KEY or not BYBIT_API_SECRET:
         raise PermissionError("Missing BYBIT_API_KEY or BYBIT_API_SECRET environment variables.")
@@ -149,26 +135,15 @@ def calculate_chandelier_exit(
     multiplier: float = ATR_MULT,
     use_close: bool = True,
 ) -> pd.DataFrame:
-    """
-    Calculate Chandelier Exit (period=22, multiplier=3.0) matching TradingView standard logic:
-      1. True Range & Wilder's RMA ATR(22)
-      2. Long Stop = Highest(Close or High, 22) - 3.0 * ATR(22)
-      3. Short Stop = Lowest(Close or Low, 22) + 3.0 * ATR(22)
-      4. Trailing Ratchet & Direction state machine (+1 Bullish / -1 Bearish)
-      5. Buy Signal on flip from -1 to +1; Sell Signal on flip from +1 to -1
-    """
     df = df.copy()
 
-    # True Range
     high_low = df["high"] - df["low"]
     high_prev_close = (df["high"] - df["close"].shift(1)).abs()
     low_prev_close = (df["low"] - df["close"].shift(1)).abs()
     df["tr"] = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
 
-    # Wilder's Smoothing (RMA) for ATR
     df["atr"] = df["tr"].ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
 
-    # Rolling Highest / Lowest
     if use_close:
         highest_val = df["close"].rolling(window=period, min_periods=period).max()
         lowest_val = df["close"].rolling(window=period, min_periods=period).min()
@@ -233,10 +208,8 @@ def calculate_chandelier_exit(
 # 4. PLOTLY LIVE CANDLESTICK + CHANDELIER EXIT CHART
 # ==============================================================================
 def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Figure:
-    """Create interactive Plotly Candlestick chart with Chandelier Exit stops & signals."""
     fig = go.Figure()
 
-    # 1. Candlesticks for selected coin
     fig.add_trace(
         go.Candlestick(
             x=df["datetime"],
@@ -250,7 +223,6 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
         )
     )
 
-    # 2. Active Long Stop (only visible when direction == 1)
     long_line = np.where(df["direction"] == 1, df["long_stop"], np.nan)
     fig.add_trace(
         go.Scatter(
@@ -263,7 +235,6 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
         )
     )
 
-    # 3. Active Short Stop (only visible when direction == -1)
     short_line = np.where(df["direction"] == -1, df["short_stop"], np.nan)
     fig.add_trace(
         go.Scatter(
@@ -276,7 +247,6 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
         )
     )
 
-    # 4. Buy Signal Markers
     buys = df[df["buy_signal"]]
     if not buys.empty:
         fig.add_trace(
@@ -291,7 +261,6 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
             )
         )
 
-    # 5. Sell Signal Markers
     sells = df[df["sell_signal"]]
     if not sells.empty:
         fig.add_trace(
@@ -328,13 +297,9 @@ def main():
     if "trade_amount_usdt" not in st.session_state:
         st.session_state.trade_amount_usdt = 50.0
 
-    # --------------------------------------------------------------------------
-    # STREAMLIT SIDEBAR (CONTROL PANEL)
-    # --------------------------------------------------------------------------
     with st.sidebar:
         st.header("Control Panel")
 
-        # 1. Dropdown Menu for Coin Selection (SOL/USDT, BTC/USDT, ETH/USDT, etc.)
         selected_pair = st.selectbox(
             "1. Select Spot Coin Pair",
             options=list(SUPPORTED_COINS.keys()),
@@ -343,13 +308,13 @@ def main():
         )
         coin_meta = SUPPORTED_COINS[selected_pair]
         symbol = coin_meta["symbol"]
+        bybit_symbol = coin_meta["bybit_symbol"]
         base_coin = coin_meta["base"]
         price_decimals = coin_meta["decimals"]
         qty_decimals = coin_meta["qty_decimals"]
 
         st.divider()
 
-        # 2. Slider + Number Input for Trade Amount in USDT ($10 to $500)
         st.subheader("2. Trade Amount (USDT)")
         slider_usdt = st.slider(
             "Select Trade Size ($10 - $500 USDT)",
@@ -372,7 +337,6 @@ def main():
 
         st.divider()
 
-        # Indicator & Auto-Trade Controls
         st.subheader("Strategy & Execution Settings")
         keys_configured = bool(BYBIT_API_KEY and BYBIT_API_SECRET)
         if keys_configured:
@@ -395,17 +359,14 @@ def main():
         auto_refresh = st.toggle("Auto-Refresh Live Chart", value=True)
         refresh_seconds = st.slider("Refresh Interval (s)", min_value=5, max_value=60, value=15)
 
-    # --------------------------------------------------------------------------
-    # FETCH LIVE 15M DATA FOR SELECTED COIN & CALCULATE CHANDELIER EXIT (22, 3)
-    # --------------------------------------------------------------------------
     st.title(f"Rozam Bot — {selected_pair} Bybit Spot Chandelier Exit (22, 3)")
     st.caption(
-        f"Active Pair: {selected_pair} ({symbol}) · Order Size: ${trade_amount_usdt:,.2f} USDT · "
+        f"Active Pair: {selected_pair} ({bybit_symbol}) · Order Size: ${trade_amount_usdt:,.2f} USDT · "
         f"Timeframe: 15-Minute · Indicator: Chandelier Exit ({ATR_PERIOD}, {ATR_MULT})"
     )
 
     try:
-        raw_df = fetch_bybit_spot_klines(symbol=symbol, interval=INTERVAL, limit=200)
+        raw_df = fetch_bybit_spot_klines(symbol=symbol, timeframe=INTERVAL, limit=200)
         df = calculate_chandelier_exit(
             raw_df,
             period=ATR_PERIOD,
@@ -413,7 +374,7 @@ def main():
             use_close=use_close_extremes,
         )
     except Exception as exc:
-        st.error(f"Error fetching {selected_pair} data from Bybit Spot API: {exc}")
+        st.error(f"Error fetching {selected_pair} data from CCXT Bybit API: {exc}")
         return
 
     eval_row = df.iloc[-2] if signal_bar_mode.startswith("Closed") else df.iloc[-1]
@@ -421,7 +382,6 @@ def main():
     current_price = float(latest_row["close"])
     estimated_base_qty = trade_amount_usdt / max(current_price, 1e-9)
 
-    # Sidebar Manual Execution Buttons (now that current_price is known)
     with st.sidebar:
         st.divider()
         st.subheader(f"Manual {selected_pair} Spot Trade")
@@ -431,7 +391,7 @@ def main():
             if st.button(f"BUY ${trade_amount_usdt:.0f}", use_container_width=True, type="primary"):
                 try:
                     res = place_bybit_spot_order_usdt(
-                        symbol=symbol,
+                        symbol=bybit_symbol,
                         side="Buy",
                         trade_amount_usdt=trade_amount_usdt,
                         last_price=current_price,
@@ -457,7 +417,7 @@ def main():
             if st.button(f"SELL ${trade_amount_usdt:.0f}", use_container_width=True):
                 try:
                     res = place_bybit_spot_order_usdt(
-                        symbol=symbol,
+                        symbol=bybit_symbol,
                         side="Sell",
                         trade_amount_usdt=trade_amount_usdt,
                         last_price=current_price,
@@ -479,7 +439,6 @@ def main():
                 except Exception as exc:
                     st.error(f"Manual Sell Failed: {exc}")
 
-    # Top KPI Metrics Row
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric(f"{selected_pair} Spot Price", f"${current_price:,.{price_decimals}f}")
     m2.metric(
@@ -501,15 +460,14 @@ def main():
         latest_sig_text = "SELL SIGNAL"
     m5.metric("Evaluation Candle Signal", latest_sig_text)
 
-    # Auto-Trade Execution on Chandelier Exit Signal Flip
     bar_ts = int(eval_row["timestamp"])
     if auto_trade_enabled:
         if eval_row["buy_signal"]:
-            sig_key = f"{symbol}_{bar_ts}_BUY"
+            sig_key = f"{bybit_symbol}_{bar_ts}_BUY"
             if sig_key not in st.session_state.executed_bar_signals:
                 try:
                     order_res = place_bybit_spot_order_usdt(
-                        symbol=symbol,
+                        symbol=bybit_symbol,
                         side="Buy",
                         trade_amount_usdt=trade_amount_usdt,
                         last_price=current_price,
@@ -534,11 +492,11 @@ def main():
                     st.error(f"Auto-Buy Order Execution Error: {exc}")
 
         elif eval_row["sell_signal"]:
-            sig_key = f"{symbol}_{bar_ts}_SELL"
+            sig_key = f"{bybit_symbol}_{bar_ts}_SELL"
             if sig_key not in st.session_state.executed_bar_signals:
                 try:
                     order_res = place_bybit_spot_order_usdt(
-                        symbol=symbol,
+                        symbol=bybit_symbol,
                         side="Sell",
                         trade_amount_usdt=trade_amount_usdt,
                         last_price=current_price,
@@ -562,11 +520,9 @@ def main():
                 except Exception as exc:
                     st.error(f"Auto-Sell Order Execution Error: {exc}")
 
-    # Render Live Plotly Chart for Selected Coin
-    fig = build_plotly_chart(df, pair_label=selected_pair, symbol=symbol)
+    fig = build_plotly_chart(df, pair_label=selected_pair, symbol=bybit_symbol)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Recent Signals & Order Execution Logs
     col_signals, col_orders = st.columns(2)
     with col_signals:
         st.subheader(f"Recent {selected_pair} Chandelier Exit (22, 3) Signals")
