@@ -275,4 +275,202 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
     fig.update_layout(
         title=dict(
             text=f"<b>{pair_label} Spot</b> · 15m Chart · Chandelier Exit ({ATR_PERIOD}, {ATR_MULT})",
-            font=dict(
+            font=dict(size=16, color="#f0f3f6")
+        ),
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#0e1117",
+        xaxis_rangeslider_visible=False,
+        height=620,
+        margin=dict(l=30, r=30, t=60, b=30),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            bgcolor="rgba(0,0,0,0.5)"
+        ),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.06)",
+            zeroline=False,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.06)",
+            zeroline=False,
+            side="right",
+        ),
+    )
+    return fig
+
+
+# ==============================================================================
+# 5. MAIN APP
+# ==============================================================================
+def main():
+    if "executed_bar_signals" not in st.session_state:
+        st.session_state.executed_bar_signals = set()
+    if "order_history" not in st.session_state:
+        st.session_state.order_history = []
+    if "trade_amount_usdt" not in st.session_state:
+        st.session_state.trade_amount_usdt = 50.0
+
+    with st.sidebar:
+        st.header("Control Panel")
+
+        selected_pair = st.selectbox(
+            "1. Select Spot Coin Pair",
+            options=list(SUPPORTED_COINS.keys()),
+            index=0,
+        )
+        coin_meta = SUPPORTED_COINS[selected_pair]
+        symbol = coin_meta["symbol"]
+        bybit_symbol = coin_meta["bybit_symbol"]
+        base_coin = coin_meta["base"]
+        price_decimals = coin_meta["decimals"]
+        qty_decimals = coin_meta["qty_decimals"]
+
+        st.divider()
+
+        st.subheader("2. Trade Amount (USDT)")
+        slider_usdt = st.slider(
+            "Select Trade Size ($10 - $500 USDT)",
+            min_value=10.0,
+            max_value=500.0,
+            value=float(st.session_state.trade_amount_usdt),
+            step=5.0,
+            format="$%.0f",
+        )
+        input_usdt = st.number_input(
+            "Exact Trade Amount (USDT)",
+            min_value=10.0,
+            max_value=500.0,
+            value=float(slider_usdt),
+            step=5.0,
+            format="%.2f",
+        )
+        trade_amount_usdt = float(input_usdt)
+        st.session_state.trade_amount_usdt = trade_amount_usdt
+
+        st.divider()
+
+        st.subheader("Strategy & Execution Settings")
+        keys_configured = bool(BYBIT_API_KEY and BYBIT_API_SECRET)
+        if keys_configured:
+            st.success("Bybit API Key Active")
+        else:
+            st.warning("BYBIT_API_KEY / BYBIT_API_SECRET not set.")
+
+        use_close_extremes = st.checkbox("Use Close Price for Extremums", value=True)
+        signal_bar_mode = st.selectbox(
+            "Signal Evaluation Candle",
+            options=["Closed Candle (Confirmed)", "Live Forming Candle"],
+            index=0,
+        )
+        auto_trade_enabled = st.toggle(
+            f"Auto-Trade {selected_pair} (${trade_amount_usdt:.0f} USDT)",
+            value=False,
+        )
+
+        auto_refresh = st.toggle("Auto-Refresh Live Chart", value=True)
+        refresh_seconds = st.slider("Refresh Interval (s)", min_value=5, max_value=60, value=15)
+
+    st.title(f"Rozam Bot — {selected_pair} Bybit Spot Chandelier Exit (22, 3)")
+    
+    try:
+        raw_df = fetch_bybit_spot_klines(symbol=symbol, timeframe=INTERVAL, limit=200)
+        df = calculate_chandelier_exit(
+            raw_df,
+            period=ATR_PERIOD,
+            multiplier=ATR_MULT,
+            use_close=use_close_extremes,
+        )
+    except Exception as exc:
+        st.error(f"Error fetching market data: {exc}")
+        return
+
+    eval_row = df.iloc[-2] if signal_bar_mode.startswith("Closed") else df.iloc[-1]
+    latest_row = df.iloc[-1]
+    current_price = float(latest_row["close"])
+    estimated_base_qty = trade_amount_usdt / max(current_price, 1e-9)
+
+    with st.sidebar:
+        st.divider()
+        st.subheader(f"Manual {selected_pair} Spot Trade")
+        col_buy, col_sell = st.columns(2)
+        with col_buy:
+            if st.button(f"BUY ${trade_amount_usdt:.0f}", use_container_width=True, type="primary"):
+                try:
+                    res = place_bybit_spot_order_usdt(
+                        symbol=bybit_symbol,
+                        side="Buy",
+                        trade_amount_usdt=trade_amount_usdt,
+                        last_price=current_price,
+                        qty_decimals=qty_decimals,
+                    )
+                    st.session_state.order_history.insert(0, {"type": "MANUAL_BUY", "response": res})
+                    st.toast("Bought successfully on Bybit!")
+                except Exception as exc:
+                    st.error(f"Manual Buy Failed: {exc}")
+
+        with col_sell:
+            if st.button(f"SELL ${trade_amount_usdt:.0f}", use_container_width=True):
+                try:
+                    res = place_bybit_spot_order_usdt(
+                        symbol=bybit_symbol,
+                        side="Sell",
+                        trade_amount_usdt=trade_amount_usdt,
+                        last_price=current_price,
+                        qty_decimals=qty_decimals,
+                    )
+                    st.session_state.order_history.insert(0, {"type": "MANUAL_SELL", "response": res})
+                    st.toast("Sold successfully on Bybit!")
+                except Exception as exc:
+                    st.error(f"Manual Sell Failed: {exc}")
+
+    bar_ts = int(eval_row["timestamp"])
+    if auto_trade_enabled:
+        if eval_row["buy_signal"]:
+            sig_key = f"{bybit_symbol}_{bar_ts}_BUY"
+            if sig_key not in st.session_state.executed_bar_signals:
+                try:
+                    order_res = place_bybit_spot_order_usdt(
+                        symbol=bybit_symbol,
+                        side="Buy",
+                        trade_amount_usdt=trade_amount_usdt,
+                        last_price=current_price,
+                        qty_decimals=qty_decimals,
+                    )
+                    st.session_state.executed_bar_signals.add(sig_key)
+                    st.session_state.order_history.insert(0, {"type": "AUTO_BUY", "response": order_res})
+                except Exception as exc:
+                    st.error(f"Auto-Buy Error: {exc}")
+
+        elif eval_row["sell_signal"]:
+            sig_key = f"{bybit_symbol}_{bar_ts}_SELL"
+            if sig_key not in st.session_state.executed_bar_signals:
+                try:
+                    order_res = place_bybit_spot_order_usdt(
+                        symbol=bybit_symbol,
+                        side="Sell",
+                        trade_amount_usdt=trade_amount_usdt,
+                        last_price=current_price,
+                        qty_decimals=qty_decimals,
+                    )
+                    st.session_state.executed_bar_signals.add(sig_key)
+                    st.session_state.order_history.insert(0, {"type": "AUTO_SELL", "response": order_res})
+                except Exception as exc:
+                    st.error(f"Auto-Sell Error: {exc}")
+
+    fig = build_plotly_chart(df, pair_label=selected_pair, symbol=bybit_symbol)
+    st.plotly_chart(fig, use_container_width=True)
+
+    if auto_refresh:
+        time.sleep(refresh_seconds)
+        st.rerun()
+
+
+if __name__ == "__main__":
+    main()
