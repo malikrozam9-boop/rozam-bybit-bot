@@ -41,10 +41,6 @@ ATR_MULT = 3.0
 # 2. MARKET DATA & ORDER EXECUTION
 # ==============================================================================
 def fetch_bybit_spot_klines(symbol: str, timeframe: str = INTERVAL, limit: int = 200) -> pd.DataFrame:
-    """
-    Fetch 15-minute Spot OHLCV data using yfinance to bypass cloud server geo-blocking,
-    while orders are executed securely on Bybit.
-    """
     base = symbol.split('/')[0]
     ticker = f"{base}-USD"
     
@@ -202,7 +198,7 @@ def calculate_chandelier_exit(
 
 
 # ==============================================================================
-# 4. PLOTLY CHART
+# 4. TRADINGVIEW-STYLE PLOTLY CHART
 # ==============================================================================
 def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Figure:
     fig = go.Figure()
@@ -215,8 +211,10 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
             low=df["low"],
             close=df["close"],
             name=f"{pair_label} (15m)",
-            increasing_line_color="#10b981",
-            decreasing_line_color="#ef4444",
+            increasing_line_color="#26a69a",
+            decreasing_line_color="#ef5350",
+            increasing_fillcolor="#26a69a",
+            decreasing_fillcolor="#ef5350",
         )
     )
 
@@ -227,7 +225,7 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
             y=long_line,
             mode="lines",
             name=f"Chandelier Long Stop ({ATR_PERIOD}, {ATR_MULT})",
-            line=dict(color="#10b981", width=2),
+            line=dict(color="#26a69a", width=2.5),
             connectgaps=False,
         )
     )
@@ -239,7 +237,7 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
             y=short_line,
             mode="lines",
             name=f"Chandelier Short Stop ({ATR_PERIOD}, {ATR_MULT})",
-            line=dict(color="#ef4444", width=2),
+            line=dict(color="#ef5350", width=2.5),
             connectgaps=False,
         )
     )
@@ -249,12 +247,13 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
         fig.add_trace(
             go.Scatter(
                 x=buys["datetime"],
-                y=buys["low"] * 0.996,
+                y=buys["low"] * 0.993,
                 mode="markers+text",
                 name="BUY Signal",
-                text=["BUY"] * len(buys),
+                text=["▲ BUY"] * len(buys),
                 textposition="bottom center",
-                marker=dict(symbol="triangle-up", size=14, color="#10b981", line=dict(width=1, color="#ffffff")),
+                textfont=dict(color="#26a69a", size=11),
+                marker=dict(symbol="triangle-up", size=14, color="#26a69a", line=dict(width=1, color="#ffffff")),
             )
         )
 
@@ -263,22 +262,46 @@ def build_plotly_chart(df: pd.DataFrame, pair_label: str, symbol: str) -> go.Fig
         fig.add_trace(
             go.Scatter(
                 x=sells["datetime"],
-                y=sells["high"] * 1.004,
+                y=sells["high"] * 1.007,
                 mode="markers+text",
                 name="SELL Signal",
-                text=["SELL"] * len(sells),
+                text=["▼ SELL"] * len(sells),
                 textposition="top center",
-                marker=dict(symbol="triangle-down", size=14, color="#ef4444", line=dict(width=1, color="#ffffff")),
+                textfont=dict(color="#ef5350", size=11),
+                marker=dict(symbol="triangle-down", size=14, color="#ef5350", line=dict(width=1, color="#ffffff")),
             )
         )
 
     fig.update_layout(
-        title=f"Bybit Spot {pair_label} ({symbol}) · 15m Timeframe · Chandelier Exit ({ATR_PERIOD}, {ATR_MULT})",
+        title=dict(
+            text=f"<b>{pair_label} Spot</b> · 15m Chart · Chandelier Exit ({ATR_PERIOD}, {ATR_MULT})",
+            font=dict(size=16, color="#f0f3f6")
+        ),
         template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#0e1117",
         xaxis_rangeslider_visible=False,
-        height=640,
-        margin=dict(l=20, r=20, t=50, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=620,
+        margin=dict(l=30, r=30, t=60, b=30),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            bgcolor="rgba(0,0,0,0.5)"
+        ),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.06)",
+            zeroline=False,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.06)",
+            zeroline=False,
+            side="right",
+        ),
     )
     return fig
 
